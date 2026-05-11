@@ -41,6 +41,13 @@ target_link_libraries(debug_rowmaj ntt_lib)
 add_executable(benchmark tests/benchmark.cu)
 target_link_libraries(benchmark ntt_lib)
 
+# Generic K-limb FP64-MMA NTT (templated over K, supports arbitrary prime sizes).
+# Self-contained: has its own main() with correctness + timing.
+add_executable(ntt_arbitrary src/ntt_mma_arbitrary.cu)
+target_compile_options(ntt_arbitrary PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+
 # ============================================================================
 # Optional: ICICLE NTT comparison (https://github.com/ingonyama-zk/icicle)
 # ----------------------------------------------------------------------------
@@ -91,6 +98,26 @@ if(ICICLE_ENABLED)
     target_compile_definitions(icicle_compare PRIVATE FIELD_ID=BABY_BEAR)
     # Embed ICICLE's lib dir as RPATH so we don't need LD_LIBRARY_PATH.
     set_target_properties(icicle_compare PROPERTIES
+        BUILD_RPATH   "${ICICLE_LIB}"
+        INSTALL_RPATH "${ICICLE_LIB}")
+
+    # ---- BN254 (254-bit) head-to-head: our K=11 MMA NTT vs ICICLE BN254. ----
+    # ICICLE's BN254 scalar field NTT lives in libicicle_field_bn254.so; the
+    # curve_bn254 lib only carries the EC-projective NTT variant.
+    find_library(ICICLE_BN254_FIELD_LIB icicle_field_bn254
+                 PATHS "${ICICLE_LIB}" NO_DEFAULT_PATH REQUIRED)
+
+    add_executable(icicle_arbitrary_compare tests/icicle_arbitrary_compare.cu)
+    target_include_directories(icicle_arbitrary_compare PRIVATE "${ICICLE_INC}")
+    target_link_libraries(icicle_arbitrary_compare PRIVATE
+        ${ICICLE_BN254_FIELD_LIB}
+        ${ICICLE_DEVICE_LIB})
+    target_compile_definitions(icicle_arbitrary_compare PRIVATE
+        FIELD_ID=BN254
+        CURVE_ID=BN254)
+    target_compile_options(icicle_arbitrary_compare PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    set_target_properties(icicle_arbitrary_compare PROPERTIES
         BUILD_RPATH   "${ICICLE_LIB}"
         INSTALL_RPATH "${ICICLE_LIB}")
 endif()
