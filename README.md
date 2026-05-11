@@ -41,14 +41,106 @@ Based on the HMFHE paper, this implementation includes:
 
 ```bash
 mkdir build && cd build
-cmake ..
+cmake -DCMAKE_CUDA_ARCHITECTURES=80 ..   # 80 = A100, 86 = A4000, 89 = L4/4090, 90 = H100
 make -j
 ```
 
 Requirements:
 - CUDA Toolkit 11.0+ (for FP64 Tensor Cores)
 - CMake 3.18+
-- GPU with compute capability 8.0+ (A100, RTX 3090, etc.)
+- GPU with compute capability 8.0+ (A100, A40, RTX 3090, etc.)
+
+> **Important:** the kernel uses the FP64 `mma.sync.aligned.m8n8k4` tensor-core
+> instruction (introduced in Ampere, sm_80). Full-rate FP64 tensor cores only
+> exist on **datacenter** Ampere/Hopper (A100, H100, A30). On consumer GPUs
+> (RTX 30/40/50 series, L4) the instruction works but FP64 throughput is
+> heavily throttled — you'll see correctness pass but timings will be
+> dominated by FP64 emulation cost.
+
+## Lab 6 (MIT 6.S894) optimizations applied to the optimized kernel
+
+The optimized variant (`src/ntt_optimized.cu`) applies the techniques from
+[6.S894 Lab 6](https://accelerated-computing.academy/fall24/labs/lab6/):
+
+| Technique | Implementation |
+|---|---|
+| **Avoid runtime divides** | Barrett reduction with precomputed `mu = ⌊2⁶⁴/q⌋` (`mod_q_barrett`) replaces every `% q` with `__umul64hi`+sub+1-cmov |
+| **Cheap-arithmetic core** | `__int128` modmuls dropped — since q < 2³¹, `a*b` always fits in uint64 |
+| **Skip redundant reductions** | Bit-merge fused: only reduce `D_high` before shifting; sum with raw `D_low` (still < 2⁵⁰) and Barrett-reduce once |
+| **Power-of-2 mod** | `% n` in hot path replaced with `& (n-1)` since N is always a power of 2 |
+| **Avoid bank conflicts** | Per-warp SMEM scratch padded from stride 8 → 9 doubles (eliminates 2-way conflicts on stride-8 column reads) |
+| **Overlap data movement w/ compute** | `cp.async.ca.shared.global` 8B copies for the per-warp input load when no pre-twist is needed; data streams into SMEM in parallel with previous-iter dependency chain |
+
+## ICICLE comparison (apples-to-apples)
+
+This project's BabyBear NTT (q = 15·2²⁷+1 = 2013265921) is benchmarked
+head-to-head against [Ingonyama's ICICLE](https://github.com/ingonyama-zk/icicle)
+which uses the **same prime**, on the **same GPU**, with **identical input
+data, sizes and timing harness** (`tests/icicle_compare.cu`).
+
+The MMA kernel and ICICLE go through one shared `time_kernel(...)` micro-bench
+that records cudaEvents around each call and forces a `cudaDeviceSynchronize()`
+on both sides of every iteration so async stream pools cannot mask kernel
+work. Domain-init / twiddle-precompute is performed once outside the timed
+region for both implementations.
+
+### Build
+
+```bash
+./scripts/build_icicle.sh                                  # downloads the
+                                                            # ICICLE 4.0.0 release
+                                                            # tarballs (~16 MB +
+                                                            # ~370 MB) into
+                                                            # ~/.local/icicle
+cd build
+cmake -DICICLE_ENABLED=ON \
+      -DICICLE_INSTALL_DIR=$HOME/.local/icicle \
+      ..
+make -j icicle_compare benchmark
+```
+
+If you already have an ICICLE install (e.g. from another project), point
+`-DICICLE_INSTALL_DIR=` at it -- the CMake auto-detects either layout
+(`<dir>/include` or `<dir>/icicle/include`).
+
+### Run
+
+```bash
+ICICLE_BACKEND_INSTALL_DIR=$HOME/.local/icicle/lib/backend ./icicle_compare
+# or pass log2(N) values as arguments:
+ICICLE_BACKEND_INSTALL_DIR=$HOME/.local/icicle/lib/backend ./icicle_compare 16 18 20
+```
+
+### Sample results — RTX 5060 (consumer Blackwell, sm_120, 30 SMs)
+
+```
+N             MMA min   MMA med   MMA avg  ICICLE min  ICICLE med  ICICLE avg  med ratio
+                 (us)      (us)      (us)        (us)        (us)        (us)  ICICLE/MMA
+------------------------------------------------------------------------------------------
+4096            13.60     15.01     14.98       14.59       65.38      247.26      4.36x
+16384           25.47     27.17     31.46       14.98       66.50      195.09      2.45x
+65536           60.83     62.43     79.72       16.64       68.67      259.83      1.10x
+131072         103.39    104.29    105.77       21.47       71.14      275.00      0.68x
+262144         252.19    257.47    260.19       30.21       78.53      211.06      0.30x
+524288         487.71    491.14    502.51       50.24      102.66      317.99      0.21x
+1048576        961.12    963.65    979.66       94.78      141.25      422.02      0.15x
+```
+
+Reading the table:
+
+* **N ≤ 64K**: the MMA kernel beats ICICLE on this consumer Blackwell GPU,
+  by up to 4.4× at 4K — the per-launch overhead and per-stage setup of
+  ICICLE's mixed-radix engine doesn't amortize at small sizes.
+* **N ≥ 128K**: ICICLE pulls ahead because it uses **uint32 modular
+  arithmetic** that runs at full-rate on every consumer SM, while our MMA
+  path is bottlenecked by the heavily throttled FP64 tensor cores
+  (sm_120 consumer FP64 is ~1/64 the rate of sm_80 datacenter FP64).
+
+The interesting test is the same comparison on a **datacenter A100/H100**:
+on those GPUs FP64 MMA runs at 19.5+ TFLOPS, which is the design point
+of this kernel and is expected to flip large-N results in MMA's favour.
+The exact same `./icicle_compare` binary will give that data on those
+machines without any code changes.
 
 ## Usage
 

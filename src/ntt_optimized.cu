@@ -357,10 +357,12 @@ void inner_ntt_tcu_kernel(
         __syncwarp();
     } else {
         uint64_t tw_stride_pre = n / macro_size;
+        // n is always a power of 2 -> use mask AND instead of slow runtime % n.
+        uint64_t n_mask = n - 1;
         for (int j = lane; j < INNER_SIZE; j += WARP_SIZE) {
             uint64_t val = data[base + (uint64_t)j * S];
             int br = bit_rev_6(j);
-            uint64_t exp_idx = (offset_o * (uint64_t)br * tw_stride_pre) % n;
+            uint64_t exp_idx = (offset_o * (uint64_t)br * tw_stride_pre) & n_mask;
             uint64_t f = twiddles[exp_idx];
             val = modmul_barrett(val, f, q, mu);
             warp_smem[wsm(j)] = val;
@@ -404,13 +406,16 @@ void inner_ntt_tcu_kernel(
     mma_m8n8k4_f64(d_low_0,  d_low_1,  tfm12_r_l, dat_bot, d_low_0, d_low_1);
 
     // Bit-merge + ModRed (Barrett): M'[i, j] = (D_high << 16 + D_low) mod q
-    //   D_high < 2^49 (sum of 4 u16*u31 products) -> fits Barrett input bound 2^62
+    //   D_high < 2^49, after Barrett < q < 2^31, *2^16 < 2^47.
+    //   D_low  < 2^49 directly.
+    //   Sum < 2^47 + 2^49 < 2^50 -- fits uint64 AND the Barrett input bound (2^62),
+    //   so we skip the inner d_low Barrett (saves 1 reduction per output).
     uint64_t mp_0 = mod_q_barrett(
         mod_q_barrett((uint64_t)d_high_0, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)d_low_0, q, mu), q, mu);
+        + (uint64_t)d_low_0, q, mu);
     uint64_t mp_1 = mod_q_barrett(
         mod_q_barrett((uint64_t)d_high_1, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)d_low_1, q, mu), q, mu);
+        + (uint64_t)d_low_1, q, mu);
 
     // ------------------------------------------------------------------
     // Inner Hadamard: M''[a, b] = M'[a, b] * omega_64^(a*b)  (TFOP-cached)
@@ -456,13 +461,13 @@ void inner_ntt_tcu_kernel(
     mma_m8n8k4_f64(g_low_0,  g_low_1,  mp_0_d, tfm34_a_l, 0.0, 0.0);
     mma_m8n8k4_f64(g_low_0,  g_low_1,  mp_1_d, tfm34_b_l, g_low_0, g_low_1);
 
-    // Bit-merge + ModRed (Barrett)
+    // Bit-merge + ModRed (Barrett, skip inner d_low Barrett -- see above)
     uint64_t g_0 = mod_q_barrett(
         mod_q_barrett((uint64_t)g_high_0, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)g_low_0, q, mu), q, mu);
+        + (uint64_t)g_low_0, q, mu);
     uint64_t g_1 = mod_q_barrett(
         mod_q_barrett((uint64_t)g_high_1, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)g_low_1, q, mu), q, mu);
+        + (uint64_t)g_low_1, q, mu);
 
     // ------------------------------------------------------------------
     // Output write: y[a*8+b] = F[a, b] = G[b, a]
@@ -707,13 +712,13 @@ void rowmaj_4step_k1_kernel(
     mma_m8n8k4_f64(d_low_0,  d_low_1,  tfm12_l_l, dat_top, 0.0, 0.0);
     mma_m8n8k4_f64(d_low_0,  d_low_1,  tfm12_r_l, dat_bot, d_low_0, d_low_1);
 
-    // Bit-merge + Barrett reduction
+    // Bit-merge + Barrett reduction (skip inner d_low Barrett, see inner kernel)
     uint64_t mp_0 = mod_q_barrett(
         mod_q_barrett((uint64_t)d_high_0, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)d_low_0, q, mu), q, mu);
+        + (uint64_t)d_low_0, q, mu);
     uint64_t mp_1 = mod_q_barrett(
         mod_q_barrett((uint64_t)d_high_1, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)d_low_1, q, mu), q, mu);
+        + (uint64_t)d_low_1, q, mu);
 
     // ----- Inner Hadamard ω_64^(a*b_inner) (Barrett) -----
     {
@@ -744,19 +749,21 @@ void rowmaj_4step_k1_kernel(
 
     uint64_t g_0 = mod_q_barrett(
         mod_q_barrett((uint64_t)g_high_0, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)g_low_0, q, mu), q, mu);
+        + (uint64_t)g_low_0, q, mu);
     uint64_t g_1 = mod_q_barrett(
         mod_q_barrett((uint64_t)g_high_1, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)g_low_1, q, mu), q, mu);
+        + (uint64_t)g_low_1, q, mu);
 
     // After NTT-64 (natural-order), lane t holds T values at positions:
     int d_0 = (lane_mod4 << 1) * 8 + lane_div4;
     int d_1 = d_0 + 8;
 
     // ----- Outer Hadamard: U[d, b] = T[d, b] * ω_N^(d*b) (Barrett) -----
+    // n is power of 2 -> bitmask is exact and faster than %.
     {
-        uint64_t tw0 = twiddles[((uint64_t)d_0 * (uint64_t)b) % n];
-        uint64_t tw1 = twiddles[((uint64_t)d_1 * (uint64_t)b) % n];
+        uint64_t n_mask = n - 1;
+        uint64_t tw0 = twiddles[((uint64_t)d_0 * (uint64_t)b) & n_mask];
+        uint64_t tw1 = twiddles[((uint64_t)d_1 * (uint64_t)b) & n_mask];
         g_0 = modmul_barrett(g_0, tw0, q, mu);
         g_1 = modmul_barrett(g_1, tw1, q, mu);
     }
@@ -830,10 +837,10 @@ void rowmaj_4step_k2_kernel(
 
     uint64_t mp_0 = mod_q_barrett(
         mod_q_barrett((uint64_t)d_high_0, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)d_low_0, q, mu), q, mu);
+        + (uint64_t)d_low_0, q, mu);
     uint64_t mp_1 = mod_q_barrett(
         mod_q_barrett((uint64_t)d_high_1, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)d_low_1, q, mu), q, mu);
+        + (uint64_t)d_low_1, q, mu);
 
     {
         int b0 = lane_mod4 << 1;
@@ -862,10 +869,10 @@ void rowmaj_4step_k2_kernel(
 
     uint64_t g_0 = mod_q_barrett(
         mod_q_barrett((uint64_t)g_high_0, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)g_low_0, q, mu), q, mu);
+        + (uint64_t)g_low_0, q, mu);
     uint64_t g_1 = mod_q_barrett(
         mod_q_barrett((uint64_t)g_high_1, q, mu) * (1ULL << 16)
-        + mod_q_barrett((uint64_t)g_low_1, q, mu), q, mu);
+        + (uint64_t)g_low_1, q, mu);
 
     // Lane t holds V[d, c_0] and V[d, c_1] in scattered NTT-output positions.
     int c_0 = (lane_mod4 << 1) * 8 + lane_div4;
