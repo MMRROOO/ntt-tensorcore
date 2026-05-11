@@ -1,0 +1,500 @@
+#include "ntt.cuh"
+#include <cuda_runtime.h>
+#include <cstdio>
+
+namespace ntt {
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+constexpr int INNER_SIZE = 64;
+constexpr int LOG_INNER  = 6;
+constexpr int WARP_SIZE  = 32;
+constexpr int WARPS_PER_BLOCK = 8;          // 8 NTTs per block (one per warp)
+constexpr int BLOCK_SIZE_INNER = WARP_SIZE * WARPS_PER_BLOCK;
+
+// ============================================================================
+// Tensor Core MMA wrapper - FP64 m8n8k4 (Ampere+ / sm_80+)
+// ============================================================================
+// PTX: mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {d0,d1}, {a0}, {b0}, {c0,c1}
+// Computes D = A(8x4) * B(4x8) + C(8x8) using FP64 tensor cores
+//
+// Lane-element distribution per the PTX ISA documentation:
+//   A (8x4 row-major):  lane t holds A[t/4, t%4]
+//   B (4x8 col-major):  lane t holds B[t%4, t/4]
+//   C/D (8x8):          lane t holds C[t/4, 2*(t%4)] and C[t/4, 2*(t%4)+1]
+
+__device__ __forceinline__
+void mma_m8n8k4_f64(double& d0, double& d1,
+                    double a, double b,
+                    double c0, double c1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
+        "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
+        : "=d"(d0), "=d"(d1)
+        : "d"(a), "d"(b), "d"(c0), "d"(c1)
+    );
+#else
+    d0 = c0; d1 = c1;
+#endif
+}
+
+// ============================================================================
+// Bit reversal helpers
+// ============================================================================
+
+__device__ __forceinline__
+int bit_rev_3(int x) {
+    return ((x & 1) << 2) | (x & 2) | ((x >> 2) & 1);
+}
+
+__device__ __forceinline__
+int bit_rev_6(int x) {
+    return (bit_rev_3(x & 7) << 3) | bit_rev_3((x >> 3) & 7);
+}
+
+__device__ __forceinline__
+uint32_t bitrev_log(uint32_t x, int log_n) {
+    uint32_t r = 0;
+    for (int i = 0; i < log_n; i++) {
+        r = (r << 1) | (x & 1);
+        x >>= 1;
+    }
+    return r;
+}
+
+__global__ void bitrev_kernel(uint64_t* data, uint64_t n, int log_n) {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    uint64_t rev = bitrev_log(idx, log_n);
+    if (idx < rev) {
+        uint64_t tmp = data[idx];
+        data[idx] = data[rev];
+        data[rev] = tmp;
+    }
+}
+
+// ============================================================================
+// Outer stage kernel (used for `extra` initial CT stages)
+// ============================================================================
+// TFOP for outer stages: stage s has only 2^s distinct twiddles, all reused
+// across many butterflies. We cache them block-wide in SMEM so that the GMEM
+// twiddle traffic drops from O(N/2) to O(2^s * N / (2 * block_size)) reads.
+// For our sizes, `extra` <= 5 -> at most 32 twiddles to cache (256 B).
+
+__global__ void outer_stage_kernel(
+    uint64_t* __restrict__ data,
+    const uint64_t* __restrict__ twiddles,
+    uint64_t n,
+    int stage,
+    uint64_t q
+) {
+    extern __shared__ uint64_t tw_smem[];
+
+    int tid       = threadIdx.x;
+    uint64_t half = 1ULL << stage;
+    uint64_t full = half << 1;
+
+    // Cooperative cache load: 2^stage distinct twiddles -> SMEM
+    if ((uint64_t)tid < half) {
+        tw_smem[tid] = twiddles[(uint64_t)tid * (n / full)];
+    }
+    __syncthreads();
+
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + (uint64_t)tid;
+    uint64_t num_bfly = n >> 1;
+    if (idx >= num_bfly) return;
+
+    uint64_t group = idx / half;
+    uint64_t pos   = idx % half;
+    uint64_t i = group * full + pos;
+    uint64_t j = i + half;
+
+    uint64_t w = tw_smem[pos];
+
+    uint64_t u = data[i];
+    uint64_t v = data[j];
+    uint64_t wv = (unsigned __int128)w * v % q;
+
+    data[i] = (u + wv) % q;
+    data[j] = (u >= wv) ? (u - wv) : (u + q - wv);
+}
+
+// ============================================================================
+// Scale kernel (for inverse NTT)
+// ============================================================================
+
+__global__ void scale_opt_kernel(
+    uint64_t* __restrict__ data,
+    uint64_t n,
+    uint64_t n_inv,
+    uint64_t q
+) {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    data[idx] = (unsigned __int128)data[idx] * n_inv % q;
+}
+
+// ============================================================================
+// Tensor-Core based Inner NTT-64 kernel (HMFHE-style: TLMOP + TransOP + TFOP)
+// ============================================================================
+// Each warp processes one 64-point inner NTT using FP64 MMA tensor cores.
+//
+// Mathematically equivalent to applying 6 CT-DIT stages [stage_start, +6) with
+// "external" twiddles linking the local 64-block to the global NTT structure:
+//
+//   1) Pre-twist input:   x'[j] = x[j] * factor[j]
+//      where  factor[j] = omega_global^(offset_o * bit_rev_6(j) * N / macro_size)
+//   2) Standard NTT-64 of bit-reversed input (= direct DFT-64 of natural input)
+//
+// NTT-64 is computed via the 4-step algorithm using FP64 tensor cores:
+//
+//   - Reshape x_natural as 8x8 matrix M[a,b] = x_natural[a*8 + b]
+//   - M'  = TFM_8 @ M                       (col-wise NTT-8 via MMA 1+2)
+//   - M'' = M' * omega_64^(a*b)             (inner Hadamard)
+//   - F   = TFM_8 @ M''^T                   (row-wise NTT-8 via MMA 3+4)
+//   - y_natural[a*8 + b] = F[a, b]
+//
+// === MPA (32-bit modulus on FP64-TCU) ===
+// TFM_8 entries are 31-bit. To keep MMA accumulator within FP64's 53-bit
+// mantissa, we split TFM into 16-bit high/low halves:
+//      TFM = TFM_high * 2^16 + TFM_low      (each < 2^16)
+// Each NTT-8 round needs 4 MMAs (2 for high, 2 for low; each pair covers two
+// 8x4 inner-dim halves). Two NTT-8 rounds per NTT-64 => 8 MMAs per warp.
+//
+// === TLMOP (Thread-Level Memory OPtimization, paper § IV-A3) ===
+// All intermediate values (D, M', M'') stay in registers between MMAs.
+// SMEM is touched only during the initial input load and the final output write.
+//
+// === TransOP (Transpose OPtimization, paper § IV-A4) ===
+// The implicit transpose required by the 4-step algorithm is realized via
+// fragment re-mapping rather than an explicit SMEM round-trip:
+//
+//   After MMA 1+2, lane t holds M''[t/4, 2*(t%4)] (=mp_0) and
+//                              M''[t/4, 2*(t%4)+1] (=mp_1) in registers.
+//
+//   For MMA 3+4 we treat M'' as Fragment A (8x8 split into even/odd columns):
+//     A_3a = M''[:, {0,2,4,6}],  lane t holds A_3a[t/4, t%4] = mp_0  (perfect!)
+//     A_3b = M''[:, {1,3,5,7}],  lane t holds A_3b[t/4, t%4] = mp_1  (perfect!)
+//   B_3a/3b is TFM split by even/odd rows:
+//     B_3a = TFM[{0,2,4,6}, :],  B_3b = TFM[{1,3,5,7}, :]
+//   The result G = M'' @ TFM is the transpose of F = TFM @ M''^T (TFM symmetric);
+//   we write G[i, j] back to data[base + (j*8+i)*S] (= y[a*8+b] with a=j, b=i).
+//
+// === TFOP (Twiddle Factor access OPtimization, paper § IV-B2) ===
+//   - TFM_8  (64 entries, omega_8^(i*k))   : block-shared SMEM, used by all warps
+//   - Hada64 (64 entries, omega_64^(a*b))  : block-shared SMEM (replaces GMEM
+//                                            access for the inner Hadamard step)
+//   - Pre-twist factors (depend on offset_o): per-warp SMEM cache, written once
+//                                            and reused 64 times (once per j)
+
+// SMEM layout offsets (in uint64_t units), per block:
+//   [0 .. 64)                                : TFM_8           (block-shared)
+//   [64 .. 128)                              : Hada64          (block-shared)
+//   [128 .. 128 + 64*WARPS_PER_BLOCK)        : per-warp scratch (input load only)
+constexpr int SMEM_TFM_OFFSET   = 0;
+constexpr int SMEM_HADA_OFFSET  = 64;
+constexpr int SMEM_WARP_OFFSET  = 128;
+constexpr int SMEM_PER_BLOCK_U64 = SMEM_WARP_OFFSET + 64 * WARPS_PER_BLOCK;
+
+__global__ __launch_bounds__(BLOCK_SIZE_INNER)
+void inner_ntt_tcu_kernel(
+    uint64_t* __restrict__ data,
+    const uint64_t* __restrict__ twiddles,
+    uint64_t n,
+    int stage_start,
+    uint64_t q
+) {
+    extern __shared__ uint64_t smem[];
+    uint64_t* tfm8_smem = smem + SMEM_TFM_OFFSET;
+    uint64_t* hada_smem = smem + SMEM_HADA_OFFSET;
+
+    int tid              = threadIdx.x;
+    int warp_id          = tid / WARP_SIZE;
+    int lane             = tid % WARP_SIZE;
+    int warps_per_block  = blockDim.x / WARP_SIZE;
+    int global_warp      = blockIdx.x * warps_per_block + warp_id;
+
+    // ------------------------------------------------------------------
+    // TFOP: block-cooperative load of TFM_8 and Hada64 (block-shared)
+    //   TFM_8 [i, k] = omega_8^(i*k)  = twiddles[(i*k * N/8 ) mod N]
+    //   Hada64[a, b] = omega_64^(a*b) = twiddles[(a*b * N/64) mod N]
+    // ------------------------------------------------------------------
+    if (tid < 64) {
+        int i = tid >> 3;
+        int k = tid & 7;
+        uint64_t exp8  = ((uint64_t)i * (uint64_t)k * (n >> 3)) % n;
+        uint64_t exp64 = ((uint64_t)i * (uint64_t)k * (n >> 6)) % n;
+        tfm8_smem[i * 8 + k] = twiddles[exp8];
+        hada_smem[i * 8 + k] = twiddles[exp64];
+    }
+    __syncthreads();
+
+    uint64_t total_ntts = n / INNER_SIZE;
+    if ((uint64_t)global_warp >= total_ntts) return;
+
+    uint64_t S          = 1ULL << stage_start;
+    uint64_t macro_size = (uint64_t)INNER_SIZE * S;
+    uint64_t macro_g    = (uint64_t)global_warp / S;
+    uint64_t offset_o   = (uint64_t)global_warp % S;
+    uint64_t base       = macro_g * macro_size + offset_o;
+
+    uint64_t* warp_smem = smem + SMEM_WARP_OFFSET + (uint64_t)warp_id * 64;
+
+    // ------------------------------------------------------------------
+    // Load 64 elements into per-warp SMEM with pre-twist applied
+    //   factor[j] = twiddles[(offset_o * bit_rev_6(j) * N/macro_size) mod N]
+    // GMEM read pattern is coalesced when S == 1; otherwise inherently strided.
+    // ------------------------------------------------------------------
+    {
+        uint64_t tw_stride_pre = n / macro_size;
+        for (int j = lane; j < INNER_SIZE; j += WARP_SIZE) {
+            uint64_t val = data[base + (uint64_t)j * S];
+            if (offset_o > 0) {
+                int br = bit_rev_6(j);
+                uint64_t exp_idx = (offset_o * (uint64_t)br * tw_stride_pre) % n;
+                uint64_t f = twiddles[exp_idx];
+                val = (unsigned __int128)val * f % q;
+            }
+            warp_smem[j] = val;
+        }
+    }
+    __syncwarp();
+
+    int lane_div4 = lane >> 2;       // 0..7  (row index of A and D fragments)
+    int lane_mod4 = lane & 3;        // 0..3  (col index of A / row of B fragments)
+
+    // ------------------------------------------------------------------
+    // MMA 1+2 fragments: A = TFM (split into LEFT/RIGHT 4-col halves)
+    //                    B = M   (split into TOP/BOTTOM 4-row halves)
+    //   Lane t holds A[t/4, t%4] for left half, A[t/4, t%4+4] for right half
+    //   Lane t holds B[t%4, t/4] for top half,  B[t%4+4, t/4] for bottom half
+    //
+    // M[a,b] = x_natural[a*8+b] = x_bitrev[bit_rev_3(b)*8 + bit_rev_3(a)]
+    // ------------------------------------------------------------------
+    uint64_t tfm12_l = tfm8_smem[lane_div4 * 8 + lane_mod4];
+    uint64_t tfm12_r = tfm8_smem[lane_div4 * 8 + lane_mod4 + 4];
+
+    double tfm12_l_h = (double)(uint32_t)(tfm12_l >> 16);
+    double tfm12_l_l = (double)(uint32_t)(tfm12_l & 0xFFFFULL);
+    double tfm12_r_h = (double)(uint32_t)(tfm12_r >> 16);
+    double tfm12_r_l = (double)(uint32_t)(tfm12_r & 0xFFFFULL);
+
+    double dat_top = (double)warp_smem[bit_rev_3(lane_div4) * 8 + bit_rev_3(lane_mod4)];
+    double dat_bot = (double)warp_smem[bit_rev_3(lane_div4) * 8 + bit_rev_3(lane_mod4 + 4)];
+
+    // ------------------------------------------------------------------
+    // MMA 1+2: D = TFM @ M (8x8 = 8x4 @ 4x8 + 8x4 @ 4x8, split by inner dim)
+    //   D_high = TFM_left_high @ M_top + TFM_right_high @ M_bot
+    //   D_low  = TFM_left_low  @ M_top + TFM_right_low  @ M_bot
+    // ------------------------------------------------------------------
+    double d_high_0 = 0.0, d_high_1 = 0.0;
+    double d_low_0  = 0.0, d_low_1  = 0.0;
+
+    mma_m8n8k4_f64(d_high_0, d_high_1, tfm12_l_h, dat_top, 0.0, 0.0);
+    mma_m8n8k4_f64(d_high_0, d_high_1, tfm12_r_h, dat_bot, d_high_0, d_high_1);
+    mma_m8n8k4_f64(d_low_0,  d_low_1,  tfm12_l_l, dat_top, 0.0, 0.0);
+    mma_m8n8k4_f64(d_low_0,  d_low_1,  tfm12_r_l, dat_bot, d_low_0, d_low_1);
+
+    // Bit-merge + ModRed: M'[i, j] = (D_high << 16 + D_low) mod q
+    //   Lane t holds M' at (t/4, 2*(t%4)) and (t/4, 2*(t%4)+1)
+    uint64_t mp_0 = ((((uint64_t)d_high_0) % q) * (1ULL << 16) + (((uint64_t)d_low_0) % q)) % q;
+    uint64_t mp_1 = ((((uint64_t)d_high_1) % q) * (1ULL << 16) + (((uint64_t)d_low_1) % q)) % q;
+
+    // ------------------------------------------------------------------
+    // Inner Hadamard: M''[a, b] = M'[a, b] * omega_64^(a*b)  (TFOP-cached)
+    // Lane t owns (a = t/4, b0 = 2*(t%4)) and (a, b1 = b0+1)
+    // ------------------------------------------------------------------
+    {
+        int b0 = lane_mod4 << 1;
+        mp_0 = (unsigned __int128)mp_0 * hada_smem[lane_div4 * 8 + b0]     % q;
+        mp_1 = (unsigned __int128)mp_1 * hada_smem[lane_div4 * 8 + b0 + 1] % q;
+    }
+
+    // ==================================================================
+    // TransOP: M'' is in A-fragment layout for MMA 3+4 directly!
+    //   A_3a[t/4, t%4] = M''[t/4, 2*(t%4)]    = mp_0  (even cols of M'')
+    //   A_3b[t/4, t%4] = M''[t/4, 2*(t%4)+1]  = mp_1  (odd  cols of M'')
+    // No SMEM transpose, no warp shuffle -- pure register reuse.
+    //
+    // The companion B-fragments are TFM with rows split by parity:
+    //   B_3a = TFM[{0,2,4,6}, :], lane t holds B_3a[t%4, t/4] = TFM[2*(t%4),   t/4]
+    //   B_3b = TFM[{1,3,5,7}, :], lane t holds B_3b[t%4, t/4] = TFM[2*(t%4)+1, t/4]
+    // ==================================================================
+    double mp_0_d = (double)mp_0;
+    double mp_1_d = (double)mp_1;
+
+    uint64_t tfm34_a = tfm8_smem[(lane_mod4 << 1)       * 8 + lane_div4];
+    uint64_t tfm34_b = tfm8_smem[((lane_mod4 << 1) + 1) * 8 + lane_div4];
+
+    double tfm34_a_h = (double)(uint32_t)(tfm34_a >> 16);
+    double tfm34_a_l = (double)(uint32_t)(tfm34_a & 0xFFFFULL);
+    double tfm34_b_h = (double)(uint32_t)(tfm34_b >> 16);
+    double tfm34_b_l = (double)(uint32_t)(tfm34_b & 0xFFFFULL);
+
+    // ------------------------------------------------------------------
+    // MMA 3+4: G = M'' @ TFM, where G[i,j] = sum_k M''[i,k]*TFM[k,j]
+    //   G_high = M''_even @ TFM_high_even_rows + M''_odd @ TFM_high_odd_rows
+    //   G_low  = M''_even @ TFM_low_even_rows  + M''_odd @ TFM_low_odd_rows
+    // Since TFM is symmetric, F = TFM @ M''^T = G^T, hence the transposed write.
+    // ------------------------------------------------------------------
+    double g_high_0 = 0.0, g_high_1 = 0.0;
+    double g_low_0  = 0.0, g_low_1  = 0.0;
+
+    mma_m8n8k4_f64(g_high_0, g_high_1, mp_0_d, tfm34_a_h, 0.0, 0.0);
+    mma_m8n8k4_f64(g_high_0, g_high_1, mp_1_d, tfm34_b_h, g_high_0, g_high_1);
+    mma_m8n8k4_f64(g_low_0,  g_low_1,  mp_0_d, tfm34_a_l, 0.0, 0.0);
+    mma_m8n8k4_f64(g_low_0,  g_low_1,  mp_1_d, tfm34_b_l, g_low_0, g_low_1);
+
+    // Bit-merge + ModRed
+    //   Lane t holds G[t/4, 2*(t%4)] and G[t/4, 2*(t%4)+1]
+    uint64_t g_0 = ((((uint64_t)g_high_0) % q) * (1ULL << 16) + (((uint64_t)g_low_0) % q)) % q;
+    uint64_t g_1 = ((((uint64_t)g_high_1) % q) * (1ULL << 16) + (((uint64_t)g_low_1) % q)) % q;
+
+    // ------------------------------------------------------------------
+    // Output write: y[a*8+b] = F[a, b] = G[b, a]
+    //   Lane t (i = t/4, j = 2*(t%4) or 2*(t%4)+1) writes G[i, j] to
+    //   data[base + (j*8 + i)*S]. The 32 lanes together cover all 64 positions.
+    // ------------------------------------------------------------------
+    {
+        int j0 = lane_mod4 << 1;
+        int j1 = j0 + 1;
+        data[base + (uint64_t)(j0 * 8 + lane_div4) * S] = g_0;
+        data[base + (uint64_t)(j1 * 8 + lane_div4) * S] = g_1;
+    }
+}
+
+// ============================================================================
+// Main optimized NTT (forward and inverse)
+// ============================================================================
+// Forward NTT structure:
+//   1. Global bit-reverse permutation
+//   2. `extra = log_n % 6` outer CT stages (stages 0 .. extra-1)
+//   3. `log_n / 6` rounds of tensor-core based 64-point inner NTTs
+//      Round k processes stages [extra+6k, extra+6k+6) with stride 2^(extra+6k)
+//
+// HMFHE optimizations realized in this kernel chain (paper § IV-A, § IV-B2):
+//   - TLMOP   (§ IV-A3) : intermediate Inner-NTT data stays in registers; no
+//                         intermediate SMEM round-trips between MMAs.
+//   - TransOP (§ IV-A4) : implicit transpose via Fragment re-mapping in
+//                         inner_ntt_tcu_kernel (no SMEM transpose).
+//   - TFOP    (§ IV-B2) : block-shared SMEM caches for TFM (radix-8), Hada64
+//                         (inner Hadamard), and per-stage outer twiddles.
+//
+// Not implemented here (would require API changes or kernels not in scope):
+//   - RowMaj  (§ IV-B1) : requires polynomials to be stored in pre-transposed
+//                         layout throughout their lifecycle; cannot be added
+//                         without breaking the canonical input/output
+//                         convention assumed by the host reference and tests.
+//   - COOP    (§ IV-C)  : co-optimization with BConv/IP kernels (none exist
+//                         in this codebase).
+//   - CRPMAC  (§ V-B)   : ciphertext-reusing PMAC (no PMAC in this codebase).
+
+void ntt_forward_optimized(uint64_t* d_data, const NTTConfig* config, cudaStream_t stream) {
+    uint64_t n     = config->n;
+    int      log_n = config->log_n;
+    uint64_t q     = config->q;
+
+    if (n < INNER_SIZE) {
+        ntt_forward_basic(d_data, config, stream);
+        return;
+    }
+
+    int block_size_outer = 256;
+    int num_blocks_n     = (n + block_size_outer - 1) / block_size_outer;
+
+    int extra      = log_n % LOG_INNER;
+    int num_rounds = log_n / LOG_INNER;
+
+    // Step 1: Global bit-reverse
+    bitrev_kernel<<<num_blocks_n, block_size_outer, 0, stream>>>(d_data, n, log_n);
+
+    // Step 2: `extra` outer CT stages (with TFOP twiddle cache)
+    for (int s = 0; s < extra; s++) {
+        int nb = ((n >> 1) + block_size_outer - 1) / block_size_outer;
+        size_t sm = (size_t)(1ULL << s) * sizeof(uint64_t);
+        outer_stage_kernel<<<nb, block_size_outer, sm, stream>>>(
+            d_data, config->d_twiddles, n, s, q
+        );
+    }
+
+    // Step 3: Tensor-Core based inner NTT-64 rounds
+    uint64_t total_ntts       = n / INNER_SIZE;
+    uint64_t total_blocks     = (total_ntts + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    size_t   smem_bytes_inner = SMEM_PER_BLOCK_U64 * sizeof(uint64_t);
+
+    for (int k = 0; k < num_rounds; k++) {
+        int stage_start = extra + LOG_INNER * k;
+        inner_ntt_tcu_kernel<<<(unsigned)total_blocks, BLOCK_SIZE_INNER, smem_bytes_inner, stream>>>(
+            d_data, config->d_twiddles, n, stage_start, q
+        );
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ntt_inverse_optimized(uint64_t* d_data, const NTTConfig* config, cudaStream_t stream) {
+    uint64_t n     = config->n;
+    int      log_n = config->log_n;
+    uint64_t q     = config->q;
+
+    if (n < INNER_SIZE) {
+        ntt_inverse_basic(d_data, config, stream);
+        return;
+    }
+
+    int block_size_outer = 256;
+    int num_blocks_n     = (n + block_size_outer - 1) / block_size_outer;
+
+    int extra      = log_n % LOG_INNER;
+    int num_rounds = log_n / LOG_INNER;
+
+    bitrev_kernel<<<num_blocks_n, block_size_outer, 0, stream>>>(d_data, n, log_n);
+
+    for (int s = 0; s < extra; s++) {
+        int nb = ((n >> 1) + block_size_outer - 1) / block_size_outer;
+        size_t sm = (size_t)(1ULL << s) * sizeof(uint64_t);
+        outer_stage_kernel<<<nb, block_size_outer, sm, stream>>>(
+            d_data, config->d_twiddles_inv, n, s, q
+        );
+    }
+
+    uint64_t total_ntts       = n / INNER_SIZE;
+    uint64_t total_blocks     = (total_ntts + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    size_t   smem_bytes_inner = SMEM_PER_BLOCK_U64 * sizeof(uint64_t);
+
+    for (int k = 0; k < num_rounds; k++) {
+        int stage_start = extra + LOG_INNER * k;
+        inner_ntt_tcu_kernel<<<(unsigned)total_blocks, BLOCK_SIZE_INNER, smem_bytes_inner, stream>>>(
+            d_data, config->d_twiddles_inv, n, stage_start, q
+        );
+    }
+
+    // Scale by N^-1
+    scale_opt_kernel<<<num_blocks_n, block_size_outer, 0, stream>>>(
+        d_data, n, config->params.n_inv, q
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// TLMOP-only variant (alias to the full optimized path; the tensor-core kernel
+// realizes the TLMOP idea by holding fragment data in registers).
+void ntt_forward_tlmop(uint64_t* d_data, const NTTConfig* config, cudaStream_t stream) {
+    ntt_forward_optimized(d_data, config, stream);
+}
+
+void ntt_inverse_tlmop(uint64_t* d_data, const NTTConfig* config, cudaStream_t stream) {
+    ntt_inverse_optimized(d_data, config, stream);
+}
+
+} // namespace ntt

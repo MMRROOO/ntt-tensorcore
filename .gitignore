@@ -1,0 +1,12 @@
+build/
+*.o
+*.obj
+*.a
+*.so
+*.cubin
+*.fatbin
+*.ptx
+.vscode/
+.idea/
+*.swp
+.DS_Store
