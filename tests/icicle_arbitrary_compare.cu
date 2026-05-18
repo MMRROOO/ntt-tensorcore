@@ -180,7 +180,13 @@ int main(int argc, char** argv) {
         ntt_arb::NTTBuffers<K> B = ntt_arb::setup_ntt<K>(log_n, /*seed=*/0xDEADBEEFULL ^ (uint64_t)log_n);
 
         Bench bo = time_kernel([&]{
-            ntt_arb::run_forward_ct<K>(B.d_data, B.d_tw, B.n, log_n, B.prime_d, B.np);
+            // Use TCU-accelerated path with MMA radix-64
+            if (B.d_tfm8 && B.d_hada64) {
+                ntt_arb::run_forward_ct_tcu<K>(B.d_data, B.d_tw, B.d_tfm8, B.d_hada64,
+                                               B.n, log_n, B.prime_d, B.np);
+            } else {
+                ntt_arb::run_forward_ct<K>(B.d_data, B.d_tw, B.n, log_n, B.prime_d, B.np);
+            }
         }, WARMUP, ITERS);
 
         // ====================================================================

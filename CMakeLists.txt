@@ -48,6 +48,12 @@ target_compile_options(ntt_arbitrary PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
 
+# Timing comparison: MMA optimized vs Radix-2 for K=2 and K=11
+add_executable(timing_compare tests/timing_compare.cu)
+target_compile_options(timing_compare PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+
 # ============================================================================
 # Optional: ICICLE NTT comparison (https://github.com/ingonyama-zk/icicle)
 # ----------------------------------------------------------------------------
