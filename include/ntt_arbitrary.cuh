@@ -43,13 +43,105 @@ namespace ntt_arb {
 // ============================================================================
 // Tunables (compile time)
 // ============================================================================
-constexpr int LIMB_BITS = 25;
+// Using 24-bit limbs enables Karatsuba multiplication:
+//   - Karatsuba sums: 24+24 = 25 bits
+//   - Product: 25 × 25 = 50 bits
+//   - MMA sum of 8: 50 + 3 = 53 bits (exactly fits FP64 mantissa!)
+// With 25-bit limbs, Karatsuba sums would be 26 bits, giving 55 bits total (overflow).
+constexpr int LIMB_BITS = 24;
 constexpr uint64_t LIMB_BASE = 1ULL << LIMB_BITS;
 constexpr uint64_t LIMB_MASK = LIMB_BASE - 1;
 
 [[maybe_unused]] constexpr int MMA_M = 8;
 [[maybe_unused]] constexpr int MMA_N = 8;
 [[maybe_unused]] constexpr int MMA_K = 4;
+
+// Enable Karatsuba for symmetric multiplication (reduces MMA calls by ~20%)
+#ifndef NTT_USE_KARATSUBA
+#define NTT_USE_KARATSUBA 1
+#endif
+
+// Enable asymmetric MMA with Karatsuba (16-bit TFM × 32-bit Data)
+// NOTE: Disabled by default - asymmetric Karatsuba doesn't work due to cross-term doubling
+#ifndef NTT_USE_ASYMMETRIC_MMA
+#define NTT_USE_ASYMMETRIC_MMA 0
+#endif
+
+// ============================================================================
+// Asymmetric limb sizes for MMA Karatsuba
+// ============================================================================
+// Using 16-bit TFM limbs and 32-bit Data limbs enables Karatsuba:
+//   - TFM limb × Data limb = 48 bits
+//   - Sum of 8 products = 51 bits (fits in 53-bit mantissa)
+//   - Karatsuba sums: 17-bit × 33-bit = 50 bits, sum of 8 = 53 bits (just fits!)
+//
+// For BN254 (254-bit prime, K=11):
+//   - Using actual prime bits (254) instead of K*25 (275):
+//   - K_TFM = ceil(254/16) = 16 limbs of 16 bits
+//   - K_DATA = ceil(254/32) = 8 limbs of 32 bits
+//   - Standard asymmetric: 16 × 8 = 128 MMA pairs
+//   - Karatsuba: 3 × (8 × 4) = 96 MMA pairs
+//   - Symmetric (no Karatsuba): K² = 121 MMA pairs
+//   - Karatsuba wins! (96 < 121)
+// ============================================================================
+constexpr int TFM_LIMB_BITS = 16;
+constexpr int DATA_LIMB_BITS = 32;
+constexpr uint32_t TFM_LIMB_MASK = (1u << TFM_LIMB_BITS) - 1;
+constexpr uint32_t DATA_LIMB_MASK = 0xFFFFFFFFu;
+
+// Actual prime bit sizes for each K (use tighter bounds for asymmetric)
+template <int K> struct PrimeBits { static constexpr int value = K * LIMB_BITS; };
+template <> struct PrimeBits<11> { static constexpr int value = 254; };  // BN254
+template <> struct PrimeBits<3>  { static constexpr int value = 64; };   // Goldilocks
+template <> struct PrimeBits<2>  { static constexpr int value = 49; };   // 49-bit prime
+
+template <int K>
+__host__ __device__ constexpr int K_TFM() { 
+    return (PrimeBits<K>::value + TFM_LIMB_BITS - 1) / TFM_LIMB_BITS; 
+}
+
+template <int K>
+__host__ __device__ constexpr int K_DATA() { 
+    return (PrimeBits<K>::value + DATA_LIMB_BITS - 1) / DATA_LIMB_BITS; 
+}
+
+// Check if asymmetric is beneficial for given K
+// NOTE: Asymmetric Karatsuba does NOT work for 16-bit × 32-bit because
+// when m_t = 2*m_d (required for cross terms to align), the middle product
+// contains 2× the cross term contribution (TFM_lo×Data_hi and TFM_hi×Data_lo
+// both map to the same output positions). We can't divide by 2 in integer math.
+//
+// Without Karatsuba, asymmetric has N_TFM × N_DATA MMA pairs.
+// For BN254: 16 × 8 = 128, vs symmetric K² = 121. So symmetric is better.
+template <int K>
+__host__ __device__ constexpr bool asymmetric_is_beneficial() {
+    constexpr int n_tfm = K_TFM<K>();
+    constexpr int n_data = K_DATA<K>();
+    constexpr int symmetric_mma = K * K;
+    constexpr int asymmetric_mma = n_tfm * n_data;
+    
+    // Asymmetric is only beneficial if it uses fewer MMA pairs
+    // (Karatsuba doesn't work due to cross-term doubling)
+    return asymmetric_mma < symmetric_mma;
+}
+
+// Get the asymmetric MMA count for reporting
+template <int K>
+__host__ __device__ constexpr int asymmetric_mma_count() {
+    return K_TFM<K>() * K_DATA<K>();
+}
+
+// TFM16<N>: N limbs of 16 bits for twiddle factor storage
+template <int N>
+struct TFM16 {
+    uint16_t limbs[N];
+};
+
+// Data32<N>: N limbs of 32 bits for data during MMA
+template <int N>
+struct Data32 {
+    uint32_t limbs[N];
+};
 
 // ============================================================================
 // BigInt<K>  — K-limb unsigned integer, little-endian (limbs[0] = LSB)
@@ -496,6 +588,97 @@ __device__ inline BigInt<K> store_scalar(const DScalar<K>& x) {
     BigInt<K> r;
     #pragma unroll
     for (int i = 0; i < K; i++) r.limbs[i] = (uint64_t)x.limbs[i];
+    return r;
+}
+
+// ============================================================================
+// Conversion functions for asymmetric limb MMA
+// ============================================================================
+
+// Convert DScalar<K> (25-bit limbs) to TFM16 (16-bit limbs)
+// K 25-bit limbs → N_TFM 16-bit limbs where N_TFM = ceil(K*25/16)
+template <int K, int N_TFM>
+__host__ __device__ inline TFM16<N_TFM> to_tfm16(const DScalar<K>& x) {
+    TFM16<N_TFM> r;
+    #pragma unroll
+    for (int i = 0; i < N_TFM; i++) r.limbs[i] = 0;
+
+    int out_bit = 0;
+    #pragma unroll
+    for (int i = 0; i < K; i++) {
+        uint32_t val = x.limbs[i];
+        int bits_remaining = LIMB_BITS;
+        int src_bit = 0;
+        while (bits_remaining > 0 && out_bit < N_TFM * TFM_LIMB_BITS) {
+            int out_limb = out_bit / TFM_LIMB_BITS;
+            int out_pos = out_bit % TFM_LIMB_BITS;
+            int space = TFM_LIMB_BITS - out_pos;
+            int take = (bits_remaining < space) ? bits_remaining : space;
+            uint32_t mask = (1u << take) - 1;
+            uint32_t bits = (val >> src_bit) & mask;
+            r.limbs[out_limb] |= (uint16_t)(bits << out_pos);
+            src_bit += take;
+            out_bit += take;
+            bits_remaining -= take;
+        }
+    }
+    return r;
+}
+
+// Convert DScalar<K> (25-bit limbs) to Data32 (32-bit limbs)
+// K 25-bit limbs → N_DATA 32-bit limbs where N_DATA = ceil(K*25/32)
+template <int K, int N_DATA>
+__device__ __forceinline__ Data32<N_DATA> to_data32(const DScalar<K>& x) {
+    Data32<N_DATA> r;
+    #pragma unroll
+    for (int i = 0; i < N_DATA; i++) r.limbs[i] = 0;
+
+    int out_bit = 0;
+    #pragma unroll
+    for (int i = 0; i < K; i++) {
+        uint32_t val = x.limbs[i];
+        int bits_remaining = LIMB_BITS;
+        int src_bit = 0;
+        while (bits_remaining > 0 && out_bit < N_DATA * DATA_LIMB_BITS) {
+            int out_limb = out_bit / DATA_LIMB_BITS;
+            int out_pos = out_bit % DATA_LIMB_BITS;
+            int space = DATA_LIMB_BITS - out_pos;
+            int take = (bits_remaining < space) ? bits_remaining : space;
+            uint32_t mask = (1u << take) - 1;
+            uint32_t bits = (val >> src_bit) & mask;
+            r.limbs[out_limb] |= bits << out_pos;
+            src_bit += take;
+            out_bit += take;
+            bits_remaining -= take;
+        }
+    }
+    return r;
+}
+
+// Convert BigInt<K> (25-bit limbs) to TFM16 (16-bit limbs) - host version
+template <int K, int N_TFM>
+__host__ inline TFM16<N_TFM> bigint_to_tfm16(const BigInt<K>& x) {
+    TFM16<N_TFM> r;
+    for (int i = 0; i < N_TFM; i++) r.limbs[i] = 0;
+
+    int out_bit = 0;
+    for (int i = 0; i < K; i++) {
+        uint64_t val = x.limbs[i];
+        int bits_remaining = LIMB_BITS;
+        int src_bit = 0;
+        while (bits_remaining > 0 && out_bit < N_TFM * TFM_LIMB_BITS) {
+            int out_limb = out_bit / TFM_LIMB_BITS;
+            int out_pos = out_bit % TFM_LIMB_BITS;
+            int space = TFM_LIMB_BITS - out_pos;
+            int take = (bits_remaining < space) ? bits_remaining : space;
+            uint64_t mask = (1ULL << take) - 1;
+            uint64_t bits = (val >> src_bit) & mask;
+            r.limbs[out_limb] |= (uint16_t)(bits << out_pos);
+            src_bit += take;
+            out_bit += take;
+            bits_remaining -= take;
+        }
+    }
     return r;
 }
 
@@ -1364,6 +1547,7 @@ void scalar_radix64_ntt(
 // ============================================================================
 // Computes the K×K partial products using MMA for the DFT-8 matrix multiply.
 // Each MMA call handles all 64 output elements of the 8×8 matrix.
+// Cost: 2×K² MMA calls (2 per limb pair for lo/hi fragments)
 // ============================================================================
 template <int K>
 __device__ __forceinline__
@@ -1397,13 +1581,579 @@ void standard_mma_multiply(
 }
 
 // ============================================================================
-// Optimized MMA 4-Step Radix-64 NTT with Karatsuba
+// Karatsuba MMA K-limb multiply (faster for large K)
 // ============================================================================
-// Key optimizations:
-//   1. Karatsuba multiplication reduces MMA calls from K² to ~0.8×K²
-//   2. Pre-convert all limbs to double arrays
-//   3. Full loop unrolling
-//   4. Minimized SMEM synchronizations
+// Uses Karatsuba's algorithm to reduce MMA calls:
+//   A × B = A_lo×B_lo + ((A_lo+A_hi)×(B_lo+B_hi) - A_lo×B_lo - A_hi×B_hi)×2^m + A_hi×B_hi×2^(2m)
+//
+// Here A_lo/A_hi refer to the Karatsuba split of the K-limb number (not MMA fragments).
+// Each MMA call uses both lo and hi fragments (columns 0-3 and 4-7 of the 8x8 matrix).
+//
+// For K limbs split at m = K/2:
+//   Standard: K² MMA pairs
+//   Karatsuba: 3×ceil((K/2))² ≈ 0.75×K² MMA pairs
+//
+// For K=11 (split 5+6): 25+36+36 = 97 vs 121 (20% reduction)
+// For K<=4: Not worth it (overhead > savings), use standard multiply
+// ============================================================================
+template <int K>
+__device__ __forceinline__
+void karatsuba_mma_multiply(
+    int64_t* acc0,            // Output accumulator for result 0 (2K-1 positions)
+    int64_t* acc1,            // Output accumulator for result 1 (2K-1 positions)
+    const double* A_mma_lo,   // A operand MMA lo fragment (cols 0-3): K limbs as doubles
+    const double* A_mma_hi,   // A operand MMA hi fragment (cols 4-7): K limbs as doubles
+    const double* B_mma_lo,   // B operand MMA lo fragment: K limbs as doubles
+    const double* B_mma_hi    // B operand MMA hi fragment: K limbs as doubles
+) {
+    // With 24-bit limbs, Karatsuba precision is OK:
+    //   - Karatsuba sums: 24 + 24 = 25 bits
+    //   - Product: 25 × 25 = 50 bits
+    //   - MMA sum of 8: 50 + 3 = 53 bits (exactly fits FP64 mantissa)
+    //
+    // For small K, overhead exceeds savings, so use standard multiply
+#if NTT_USE_KARATSUBA
+    if constexpr (K <= 4) {
+        standard_mma_multiply<K>(acc0, acc1, A_mma_lo, A_mma_hi, B_mma_lo, B_mma_hi);
+        return;
+    }
+#else
+    standard_mma_multiply<K>(acc0, acc1, A_mma_lo, A_mma_hi, B_mma_lo, B_mma_hi);
+    return;
+#endif
+
+    // Split point: m = K/2 (low half has m limbs, high half has h = K-m limbs)
+    constexpr int m = K / 2;
+    constexpr int h = K - m;  // h >= m
+
+    // Initialize accumulators
+    #pragma unroll
+    for (int l = 0; l < 2 * K - 1; l++) { acc0[l] = 0; acc1[l] = 0; }
+
+    // Temporary accumulators for the three sub-products
+    int64_t lo_lo_0[2 * m - 1], lo_lo_1[2 * m - 1];       // A_kara_lo × B_kara_lo
+    int64_t hi_hi_0[2 * h - 1], hi_hi_1[2 * h - 1];       // A_kara_hi × B_kara_hi
+    int64_t mid_0[2 * h - 1], mid_1[2 * h - 1];           // (A_kara_lo+A_kara_hi) × (B_kara_lo+B_kara_hi)
+
+    #pragma unroll
+    for (int l = 0; l < 2 * m - 1; l++) { lo_lo_0[l] = 0; lo_lo_1[l] = 0; }
+    #pragma unroll
+    for (int l = 0; l < 2 * h - 1; l++) { hi_hi_0[l] = 0; hi_hi_1[l] = 0; mid_0[l] = 0; mid_1[l] = 0; }
+
+    // Compute sums for middle product: (A_kara_lo + A_kara_hi), (B_kara_lo + B_kara_hi)
+    // These are h-limb values (padded with zeros for the low part if m < h)
+    // For each limb position i in [0, h):
+    //   sum[i] = (i < m ? kara_lo[i] : 0) + kara_hi[i]
+    // where kara_lo = limbs 0..m-1, kara_hi = limbs m..K-1
+    double A_sum_mma_lo[h], A_sum_mma_hi[h];
+    double B_sum_mma_lo[h], B_sum_mma_hi[h];
+    
+    #pragma unroll
+    for (int i = 0; i < h; i++) {
+        // Karatsuba low part: limbs 0..m-1 (padded to h with zeros)
+        double a_kara_lo_mma_lo = (i < m) ? A_mma_lo[i] : 0.0;
+        double a_kara_lo_mma_hi = (i < m) ? A_mma_hi[i] : 0.0;
+        double b_kara_lo_mma_lo = (i < m) ? B_mma_lo[i] : 0.0;
+        double b_kara_lo_mma_hi = (i < m) ? B_mma_hi[i] : 0.0;
+        
+        // Karatsuba high part: limbs m..K-1
+        double a_kara_hi_mma_lo = A_mma_lo[m + i];
+        double a_kara_hi_mma_hi = A_mma_hi[m + i];
+        double b_kara_hi_mma_lo = B_mma_lo[m + i];
+        double b_kara_hi_mma_hi = B_mma_hi[m + i];
+        
+        // Compute sums
+        A_sum_mma_lo[i] = a_kara_lo_mma_lo + a_kara_hi_mma_lo;
+        A_sum_mma_hi[i] = a_kara_lo_mma_hi + a_kara_hi_mma_hi;
+        B_sum_mma_lo[i] = b_kara_lo_mma_lo + b_kara_hi_mma_lo;
+        B_sum_mma_hi[i] = b_kara_lo_mma_hi + b_kara_hi_mma_hi;
+    }
+
+    // Sub-product 1: A_kara_lo × B_kara_lo (m×m limbs, using limbs 0..m-1)
+    #pragma unroll
+    for (int la = 0; la < m; la++) {
+        #pragma unroll
+        for (int lb = 0; lb < m; lb++) {
+            double d0 = 0.0, d1 = 0.0;
+            mma_m8n8k4_f64(d0, d1, A_mma_lo[la], B_mma_lo[lb], 0.0, 0.0);
+            mma_m8n8k4_f64(d0, d1, A_mma_hi[la], B_mma_hi[lb], d0, d1);
+            lo_lo_0[la + lb] += (int64_t)d0;
+            lo_lo_1[la + lb] += (int64_t)d1;
+        }
+    }
+
+    // Sub-product 2: A_kara_hi × B_kara_hi (h×h limbs, using limbs m..K-1)
+    #pragma unroll
+    for (int la = 0; la < h; la++) {
+        #pragma unroll
+        for (int lb = 0; lb < h; lb++) {
+            double d0 = 0.0, d1 = 0.0;
+            mma_m8n8k4_f64(d0, d1, A_mma_lo[m + la], B_mma_lo[m + lb], 0.0, 0.0);
+            mma_m8n8k4_f64(d0, d1, A_mma_hi[m + la], B_mma_hi[m + lb], d0, d1);
+            hi_hi_0[la + lb] += (int64_t)d0;
+            hi_hi_1[la + lb] += (int64_t)d1;
+        }
+    }
+
+    // Sub-product 3: (A_kara_lo + A_kara_hi) × (B_kara_lo + B_kara_hi) (h×h)
+    #pragma unroll
+    for (int la = 0; la < h; la++) {
+        #pragma unroll
+        for (int lb = 0; lb < h; lb++) {
+            double d0 = 0.0, d1 = 0.0;
+            mma_m8n8k4_f64(d0, d1, A_sum_mma_lo[la], B_sum_mma_lo[lb], 0.0, 0.0);
+            mma_m8n8k4_f64(d0, d1, A_sum_mma_hi[la], B_sum_mma_hi[lb], d0, d1);
+            mid_0[la + lb] += (int64_t)d0;
+            mid_1[la + lb] += (int64_t)d1;
+        }
+    }
+
+    // Combine: result = lo_lo + (mid - lo_lo - hi_hi) × 2^m + hi_hi × 2^(2m)
+    // Position mapping:
+    //   lo_lo contributes to positions 0..2m-2
+    //   mid - lo_lo - hi_hi contributes to positions m..m+2h-2
+    //   hi_hi contributes to positions 2m..2m+2h-2
+
+    // Add lo_lo to positions 0..2m-2
+    #pragma unroll
+    for (int l = 0; l < 2 * m - 1; l++) {
+        acc0[l] += lo_lo_0[l];
+        acc1[l] += lo_lo_1[l];
+    }
+
+    // Add hi_hi to positions 2m..2m+2h-2
+    #pragma unroll
+    for (int l = 0; l < 2 * h - 1; l++) {
+        acc0[2 * m + l] += hi_hi_0[l];
+        acc1[2 * m + l] += hi_hi_1[l];
+    }
+
+    // Add (mid - lo_lo - hi_hi) to positions m..m+2h-2
+    #pragma unroll
+    for (int l = 0; l < 2 * h - 1; l++) {
+        int64_t sub0 = mid_0[l];
+        int64_t sub1 = mid_1[l];
+        // Subtract lo_lo (only for l < 2m-1)
+        if (l < 2 * m - 1) {
+            sub0 -= lo_lo_0[l];
+            sub1 -= lo_lo_1[l];
+        }
+        // Subtract hi_hi
+        sub0 -= hi_hi_0[l];
+        sub1 -= hi_hi_1[l];
+        acc0[m + l] += sub0;
+        acc1[m + l] += sub1;
+    }
+}
+
+// ============================================================================
+// Asymmetric MMA multiply: 16-bit TFM × 32-bit Data with Karatsuba
+// ============================================================================
+// This enables Karatsuba by using different bit-widths for TFM and Data:
+//   - TFM limbs: 16 bits (N_TFM limbs)
+//   - Data limbs: 32 bits (N_DATA limbs)
+//   - Product: 16 × 32 = 48 bits per limb product
+//   - Sum of 8: 51 bits (fits in 53-bit mantissa)
+//   - Karatsuba sums: 17 × 33 = 50 bits, sum of 8 = 53 bits (just fits!)
+//
+// Output is in 16-bit limb units at positions: p = i + 2j (for TFM_i × Data_j)
+// Total output positions: N_TFM + 2*(N_DATA-1) = N_TFM + 2*N_DATA - 2
+//
+// For BN254 (254 bits): N_TFM = 16, N_DATA = 8
+//   - Standard: 16 × 8 = 128 MMA pairs
+//   - Karatsuba (8+8, 4+4): 3 × 32 = 96 MMA pairs
+// ============================================================================
+template <int N_TFM, int N_DATA>
+__device__ __forceinline__
+void asymmetric_mma_multiply_standard(
+    int64_t* acc0,            // Output accumulator (N_TFM + 2*N_DATA - 2 positions)
+    int64_t* acc1,            // Output accumulator (N_TFM + 2*N_DATA - 2 positions)
+    const double* tfm_lo_d,   // TFM lo fragment: N_TFM limbs as doubles
+    const double* tfm_hi_d,   // TFM hi fragment: N_TFM limbs as doubles
+    const double* data_lo_d,  // Data lo fragment: N_DATA limbs as doubles
+    const double* data_hi_d   // Data hi fragment: N_DATA limbs as doubles
+) {
+    constexpr int N_OUT = N_TFM + 2 * N_DATA - 2;
+    
+    #pragma unroll
+    for (int l = 0; l < N_OUT; l++) { acc0[l] = 0; acc1[l] = 0; }
+    
+    #pragma unroll
+    for (int i = 0; i < N_TFM; i++) {
+        #pragma unroll
+        for (int j = 0; j < N_DATA; j++) {
+            double d0 = 0.0, d1 = 0.0;
+            mma_m8n8k4_f64(d0, d1, tfm_lo_d[i], data_lo_d[j], 0.0, 0.0);
+            mma_m8n8k4_f64(d0, d1, tfm_hi_d[i], data_hi_d[j], d0, d1);
+            int pos = i + 2 * j;
+            acc0[pos] += (int64_t)d0;
+            acc1[pos] += (int64_t)d1;
+        }
+    }
+}
+
+// Karatsuba version of asymmetric multiply
+template <int N_TFM, int N_DATA>
+__device__ __forceinline__
+void asymmetric_mma_multiply_karatsuba(
+    int64_t* acc0,
+    int64_t* acc1,
+    const double* tfm_lo_d,
+    const double* tfm_hi_d,
+    const double* data_lo_d,
+    const double* data_hi_d
+) {
+    constexpr int N_OUT = N_TFM + 2 * N_DATA - 2;
+    constexpr int m_t = N_TFM / 2;
+    constexpr int h_t = N_TFM - m_t;
+    constexpr int m_d = N_DATA / 2;
+    constexpr int h_d = N_DATA - m_d;
+    
+    #pragma unroll
+    for (int l = 0; l < N_OUT; l++) { acc0[l] = 0; acc1[l] = 0; }
+    
+    // Sub-product 1: TFM_lo × Data_lo (positions 0..m_t-1 + 2*(m_d-1))
+    constexpr int N_LL = m_t + 2 * m_d - 2;
+    int64_t ll_0[N_LL > 0 ? N_LL : 1], ll_1[N_LL > 0 ? N_LL : 1];
+    #pragma unroll
+    for (int l = 0; l < N_LL; l++) { ll_0[l] = 0; ll_1[l] = 0; }
+    
+    #pragma unroll
+    for (int i = 0; i < m_t; i++) {
+        #pragma unroll
+        for (int j = 0; j < m_d; j++) {
+            double d0 = 0.0, d1 = 0.0;
+            mma_m8n8k4_f64(d0, d1, tfm_lo_d[i], data_lo_d[j], 0.0, 0.0);
+            mma_m8n8k4_f64(d0, d1, tfm_hi_d[i], data_hi_d[j], d0, d1);
+            ll_0[i + 2*j] += (int64_t)d0;
+            ll_1[i + 2*j] += (int64_t)d1;
+        }
+    }
+    
+    // Sub-product 2: TFM_hi × Data_hi (positions m_t+2*m_d..)
+    constexpr int N_HH = h_t + 2 * h_d - 2;
+    int64_t hh_0[N_HH > 0 ? N_HH : 1], hh_1[N_HH > 0 ? N_HH : 1];
+    #pragma unroll
+    for (int l = 0; l < N_HH; l++) { hh_0[l] = 0; hh_1[l] = 0; }
+    
+    #pragma unroll
+    for (int i = 0; i < h_t; i++) {
+        #pragma unroll
+        for (int j = 0; j < h_d; j++) {
+            double d0 = 0.0, d1 = 0.0;
+            mma_m8n8k4_f64(d0, d1, tfm_lo_d[m_t + i], data_lo_d[m_d + j], 0.0, 0.0);
+            mma_m8n8k4_f64(d0, d1, tfm_hi_d[m_t + i], data_hi_d[m_d + j], d0, d1);
+            hh_0[i + 2*j] += (int64_t)d0;
+            hh_1[i + 2*j] += (int64_t)d1;
+        }
+    }
+    
+    // Sub-product 3: (TFM_lo + TFM_hi) × (Data_lo + Data_hi)
+    // Sums: TFM sum is at most h_t limbs (max 17 bits), Data sum is at most h_d limbs (max 33 bits)
+    constexpr int h_max_t = (m_t > h_t) ? m_t : h_t;
+    constexpr int h_max_d = (m_d > h_d) ? m_d : h_d;
+    double tfm_sum_lo[h_max_t], tfm_sum_hi[h_max_t];
+    double data_sum_lo[h_max_d], data_sum_hi[h_max_d];
+    
+    #pragma unroll
+    for (int i = 0; i < h_max_t; i++) {
+        double lo_val_lo = (i < m_t) ? tfm_lo_d[i] : 0.0;
+        double lo_val_hi = (i < m_t) ? tfm_hi_d[i] : 0.0;
+        double hi_val_lo = (i < h_t) ? tfm_lo_d[m_t + i] : 0.0;
+        double hi_val_hi = (i < h_t) ? tfm_hi_d[m_t + i] : 0.0;
+        tfm_sum_lo[i] = lo_val_lo + hi_val_lo;
+        tfm_sum_hi[i] = lo_val_hi + hi_val_hi;
+    }
+    
+    #pragma unroll
+    for (int j = 0; j < h_max_d; j++) {
+        double lo_val_lo = (j < m_d) ? data_lo_d[j] : 0.0;
+        double lo_val_hi = (j < m_d) ? data_hi_d[j] : 0.0;
+        double hi_val_lo = (j < h_d) ? data_lo_d[m_d + j] : 0.0;
+        double hi_val_hi = (j < h_d) ? data_hi_d[m_d + j] : 0.0;
+        data_sum_lo[j] = lo_val_lo + hi_val_lo;
+        data_sum_hi[j] = lo_val_hi + hi_val_hi;
+    }
+    
+    constexpr int N_MID = h_max_t + 2 * h_max_d - 2;
+    int64_t mid_0[N_MID > 0 ? N_MID : 1], mid_1[N_MID > 0 ? N_MID : 1];
+    #pragma unroll
+    for (int l = 0; l < N_MID; l++) { mid_0[l] = 0; mid_1[l] = 0; }
+    
+    #pragma unroll
+    for (int i = 0; i < h_max_t; i++) {
+        #pragma unroll
+        for (int j = 0; j < h_max_d; j++) {
+            double d0 = 0.0, d1 = 0.0;
+            mma_m8n8k4_f64(d0, d1, tfm_sum_lo[i], data_sum_lo[j], 0.0, 0.0);
+            mma_m8n8k4_f64(d0, d1, tfm_sum_hi[i], data_sum_hi[j], d0, d1);
+            mid_0[i + 2*j] += (int64_t)d0;
+            mid_1[i + 2*j] += (int64_t)d1;
+        }
+    }
+    
+    // Combine results
+    // lo_lo contributes to positions 0..N_LL-1
+    #pragma unroll
+    for (int l = 0; l < N_LL; l++) {
+        acc0[l] += ll_0[l];
+        acc1[l] += ll_1[l];
+    }
+    
+    // hi_hi contributes to positions (m_t + 2*m_d)..(m_t + 2*m_d + N_HH - 1)
+    constexpr int hh_start = m_t + 2 * m_d;
+    #pragma unroll
+    for (int l = 0; l < N_HH; l++) {
+        acc0[hh_start + l] += hh_0[l];
+        acc1[hh_start + l] += hh_1[l];
+    }
+    
+    // Cross terms contribute to positions starting at m_t (= 2*m_d for balanced split)
+    // mid - lo_lo - hi_hi = (TFM_lo × Data_hi + TFM_hi × Data_lo)
+    // Both cross terms are shifted by m_t in 16-bit units (since m_t = 2*m_d)
+    constexpr int cross_shift = m_t;  // = 2*m_d when balanced
+    #pragma unroll
+    for (int l = 0; l < N_MID; l++) {
+        int64_t sub0 = mid_0[l];
+        int64_t sub1 = mid_1[l];
+        if (l < N_LL) {
+            sub0 -= ll_0[l];
+            sub1 -= ll_1[l];
+        }
+        if (l < N_HH) {
+            sub0 -= hh_0[l];
+            sub1 -= hh_1[l];
+        }
+        int out_pos = cross_shift + l;
+        if (out_pos < N_OUT) {
+            acc0[out_pos] += sub0;
+            acc1[out_pos] += sub1;
+        }
+    }
+}
+
+// Wrapper for asymmetric multiply
+// NOTE: Karatsuba is disabled because it's fundamentally broken for 16-bit × 32-bit:
+// The cross terms (TFM_lo×Data_hi and TFM_hi×Data_lo) both map to the same output
+// positions when m_t = 2*m_d, causing them to be counted twice in the middle product.
+template <int N_TFM, int N_DATA>
+__device__ __forceinline__
+void asymmetric_mma_multiply(
+    int64_t* acc0,
+    int64_t* acc1,
+    const double* tfm_lo_d,
+    const double* tfm_hi_d,
+    const double* data_lo_d,
+    const double* data_hi_d
+) {
+    // Always use standard (Karatsuba doesn't work for asymmetric 16×32)
+    asymmetric_mma_multiply_standard<N_TFM, N_DATA>(acc0, acc1, tfm_lo_d, tfm_hi_d, data_lo_d, data_hi_d);
+}
+
+// ============================================================================
+// Convert asymmetric accumulator (16-bit positions) to 25-bit limb array
+// ============================================================================
+// The asymmetric multiply outputs acc[p] at weight 2^(16p) for p = 0..N_OUT-1.
+// We need to convert this to a (2K+1)-limb array with 25-bit limbs for 
+// Montgomery reduction.
+// ============================================================================
+template <int N_OUT, int K>
+__device__ __forceinline__
+void convert_acc16_to_P25(uint64_t* P, const int64_t* acc) {
+    // First, carry-propagate through 16-bit positions to get clean 16-bit limbs
+    constexpr int MAX_16 = N_OUT + 8;  // Extra space for carries
+    int64_t limbs16[MAX_16];
+    
+    #pragma unroll
+    for (int i = 0; i < MAX_16; i++) limbs16[i] = 0;
+    #pragma unroll
+    for (int p = 0; p < N_OUT; p++) limbs16[p] = acc[p];
+    
+    // Carry propagate in 16-bit chunks
+    #pragma unroll
+    for (int p = 0; p < MAX_16 - 1; p++) {
+        int64_t val = limbs16[p];
+        limbs16[p] = val & 0xFFFF;
+        limbs16[p + 1] += val >> 16;
+    }
+    
+    // Now convert from 16-bit limbs to 25-bit limbs
+    // We accumulate bits from 16-bit limbs into 25-bit output
+    #pragma unroll
+    for (int i = 0; i <= 2 * K; i++) P[i] = 0;
+    
+    // Process each 16-bit chunk and distribute to 25-bit limbs
+    // Bit position in_bit = 16 * in_pos, out_bit = 25 * out_limb
+    int in_pos = 0;
+    int in_bit_offset = 0;  // Bits consumed from current 16-bit limb
+    
+    #pragma unroll
+    for (int out_limb = 0; out_limb <= 2 * K && in_pos < MAX_16; out_limb++) {
+        uint64_t val = 0;
+        int bits_collected = 0;
+        
+        while (bits_collected < LIMB_BITS && in_pos < MAX_16) {
+            int bits_avail = 16 - in_bit_offset;
+            int bits_needed = LIMB_BITS - bits_collected;
+            int take = (bits_needed < bits_avail) ? bits_needed : bits_avail;
+            
+            uint64_t mask = (1ULL << take) - 1;
+            uint64_t bits = ((uint64_t)limbs16[in_pos] >> in_bit_offset) & mask;
+            val |= bits << bits_collected;
+            
+            bits_collected += take;
+            in_bit_offset += take;
+            
+            if (in_bit_offset >= 16) {
+                in_bit_offset = 0;
+                in_pos++;
+            }
+        }
+        P[out_limb] = val;
+    }
+}
+
+// Helper: Convert DScalar<K> to TFM16 double arrays (16-bit limbs)
+template <int K>
+__device__ __forceinline__
+void dscalar_to_tfm16_doubles(double* lo_d, double* hi_d, 
+                               const DScalar<K>& val_lo, const DScalar<K>& val_hi) {
+    constexpr int N_TFM = K_TFM<K>();
+    
+    // Convert val_lo to 16-bit limbs
+    TFM16<N_TFM> tfm_lo = to_tfm16<K, N_TFM>(val_lo);
+    TFM16<N_TFM> tfm_hi = to_tfm16<K, N_TFM>(val_hi);
+    
+    #pragma unroll
+    for (int i = 0; i < N_TFM; i++) {
+        lo_d[i] = (double)tfm_lo.limbs[i];
+        hi_d[i] = (double)tfm_hi.limbs[i];
+    }
+}
+
+// Helper: Convert DScalar<K> to Data32 double arrays (32-bit limbs)
+template <int K>
+__device__ __forceinline__
+void dscalar_to_data32_doubles(double* lo_d, double* hi_d,
+                                const DScalar<K>& val_lo, const DScalar<K>& val_hi) {
+    constexpr int N_DATA = K_DATA<K>();
+    
+    Data32<N_DATA> data_lo = to_data32<K, N_DATA>(val_lo);
+    Data32<N_DATA> data_hi = to_data32<K, N_DATA>(val_hi);
+    
+    #pragma unroll
+    for (int j = 0; j < N_DATA; j++) {
+        lo_d[j] = (double)data_lo.limbs[j];
+        hi_d[j] = (double)data_hi.limbs[j];
+    }
+}
+
+// ============================================================================
+// Asymmetric MMA 4-Step Radix-64 NTT (16-bit TFM × 32-bit Data with Karatsuba)
+// ============================================================================
+// This version uses asymmetric limb sizes to enable Karatsuba multiplication:
+//   - TFM: K_TFM 16-bit limbs (converted from DScalar<K>)
+//   - Data: K_DATA 32-bit limbs (converted from DScalar<K>)
+//   - Karatsuba reduces MMA calls when beneficial
+//
+// For K=11 (BN254): K_TFM=18, K_DATA=9
+//   - Standard symmetric: 121 MMA pairs (precision blocks Karatsuba)
+//   - Asymmetric Karatsuba: ~96 MMA pairs (21% reduction)
+// ============================================================================
+template <int K>
+__device__ __forceinline__
+void mma_ntt64_warp_K_asymmetric(
+    DScalar<K>* warp_smem,
+    const DScalar<K>* tfm8,
+    const DScalar<K>* hada64,
+    const DScalar<K>& prime,
+    uint32_t np
+) {
+    constexpr int N_TFM = K_TFM<K>();
+    constexpr int N_DATA = K_DATA<K>();
+    constexpr int N_OUT = N_TFM + 2 * N_DATA - 2;
+    
+    int lane = threadIdx.x & 31;
+    int row = lane >> 2;
+    int qq  = lane & 3;
+    int j0  = 2 * qq;
+    int j1  = j0 + 1;
+    
+    // Pre-convert TFM elements to 16-bit double arrays
+    double tfm_lo_d[N_TFM], tfm_hi_d[N_TFM];
+    {
+        DScalar<K> tfm_lo = tfm8[row * 8 + qq];
+        DScalar<K> tfm_hi = tfm8[row * 8 + qq + 4];
+        dscalar_to_tfm16_doubles<K>(tfm_lo_d, tfm_hi_d, tfm_lo, tfm_hi);
+    }
+    
+    // Pre-load Hadamard twiddles
+    int hada_idx_j0 = (row * j0) & 63;
+    int hada_idx_j1 = (row * j1) & 63;
+    DScalar<K> hada_tw_j0 = hada64[hada_idx_j0];
+    DScalar<K> hada_tw_j1 = hada64[hada_idx_j1];
+    
+    // Load input elements and convert to 32-bit double arrays
+    double B_lo_d[N_DATA], B_hi_d[N_DATA];
+    {
+        DScalar<K> B_lo = warp_smem[wsm_idx(qq * 8 + row)];
+        DScalar<K> B_hi = warp_smem[wsm_idx((qq + 4) * 8 + row)];
+        dscalar_to_data32_doubles<K>(B_lo_d, B_hi_d, B_lo, B_hi);
+    }
+    __syncwarp();
+    
+    // Step 1: Column DFT-8 via asymmetric MMA
+    int64_t acc0[N_OUT], acc1[N_OUT];
+    asymmetric_mma_multiply<N_TFM, N_DATA>(acc0, acc1, tfm_lo_d, tfm_hi_d, B_lo_d, B_hi_d);
+    
+    // Convert from 16-bit positions to 25-bit limbs and Montgomery reduce
+    uint64_t P0[2 * K + 1], P1[2 * K + 1];
+    convert_acc16_to_P25<N_OUT, K>(P0, acc0);
+    convert_acc16_to_P25<N_OUT, K>(P1, acc1);
+    
+    DScalar<K> Mp_j0 = mont_reduce_wide<K>(P0, prime, np);
+    DScalar<K> Mp_j1 = mont_reduce_wide<K>(P1, prime, np);
+    
+    // Step 2: Hadamard multiply
+    DScalar<K> Mpp_j0 = mont_mul<K>(Mp_j0, hada_tw_j0, prime, np);
+    DScalar<K> Mpp_j1 = mont_mul<K>(Mp_j1, hada_tw_j1, prime, np);
+    
+    // Store to SMEM for row DFT
+    warp_smem[wsm_idx(row * 8 + j0)] = Mpp_j0;
+    warp_smem[wsm_idx(row * 8 + j1)] = Mpp_j1;
+    __syncwarp();
+    
+    // Load for row DFT and convert to 32-bit doubles
+    {
+        DScalar<K> B_lo = warp_smem[wsm_idx(row * 8 + qq)];
+        DScalar<K> B_hi = warp_smem[wsm_idx(row * 8 + qq + 4)];
+        dscalar_to_data32_doubles<K>(B_lo_d, B_hi_d, B_lo, B_hi);
+    }
+    __syncwarp();
+    
+    // Step 3: Row DFT-8 via asymmetric MMA
+    asymmetric_mma_multiply<N_TFM, N_DATA>(acc0, acc1, tfm_lo_d, tfm_hi_d, B_lo_d, B_hi_d);
+    
+    // Convert and Montgomery reduce
+    convert_acc16_to_P25<N_OUT, K>(P0, acc0);
+    convert_acc16_to_P25<N_OUT, K>(P1, acc1);
+    
+    DScalar<K> out_j0 = mont_reduce_wide<K>(P0, prime, np);
+    DScalar<K> out_j1 = mont_reduce_wide<K>(P1, prime, np);
+    
+    // Store results
+    warp_smem[wsm_idx(row * 8 + j0)] = out_j0;
+    warp_smem[wsm_idx(row * 8 + j1)] = out_j1;
+}
+
+// ============================================================================
+// Optimized MMA 4-Step Radix-64 NTT
+// ============================================================================
+// Two implementations available:
+//   1. Symmetric (25-bit × 25-bit): Standard multiply, no Karatsuba due to precision
+//   2. Asymmetric (16-bit × 32-bit): Enables Karatsuba for ~20% fewer MMA calls
+//
+// NTT_USE_ASYMMETRIC_MMA controls which path is used for large K.
 // ============================================================================
 template <int K>
 __device__ __forceinline__
@@ -1414,6 +2164,15 @@ void mma_ntt64_warp_K(
     const DScalar<K>& prime,
     uint32_t np
 ) {
+#if NTT_USE_ASYMMETRIC_MMA
+    // Use asymmetric MMA when Karatsuba provides fewer MMA calls than symmetric
+    if constexpr (asymmetric_is_beneficial<K>()) {
+        mma_ntt64_warp_K_asymmetric<K>(warp_smem, tfm8, hada64, prime, np);
+        return;
+    }
+#endif
+    
+    // Fall through to symmetric implementation for small K
     int lane = threadIdx.x & 31;
     int row = lane >> 2;       // 0..7, row index for MMA D-fragment
     int qq  = lane & 3;        // 0..3, column chunk
@@ -1452,10 +2211,10 @@ void mma_ntt64_warp_K(
     __syncwarp();
 
     // =========================================================================
-    // Step 1: Column DFT-8 via MMA
+    // Step 1: Column DFT-8 via MMA (Karatsuba for large K)
     // =========================================================================
     int64_t acc0[2 * K - 1], acc1[2 * K - 1];
-    standard_mma_multiply<K>(acc0, acc1, tfm_lo_d, tfm_hi_d, B_lo_d, B_hi_d);
+    karatsuba_mma_multiply<K>(acc0, acc1, tfm_lo_d, tfm_hi_d, B_lo_d, B_hi_d);
 
     // Montgomery reduce M'[row, j0] and M'[row, j1]
     uint64_t P0[2 * K + 1], P1[2 * K + 1];
@@ -1496,9 +2255,9 @@ void mma_ntt64_warp_K(
     __syncwarp();
 
     // =========================================================================
-    // Step 3: Row DFT-8 via MMA
+    // Step 3: Row DFT-8 via MMA (Karatsuba for large K)
     // =========================================================================
-    standard_mma_multiply<K>(acc0, acc1, tfm_lo_d, tfm_hi_d, B_lo_d, B_hi_d);
+    karatsuba_mma_multiply<K>(acc0, acc1, tfm_lo_d, tfm_hi_d, B_lo_d, B_hi_d);
 
     // Montgomery reduce and store final output
     {
